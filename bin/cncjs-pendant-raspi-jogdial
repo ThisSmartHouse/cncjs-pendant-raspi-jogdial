@@ -1,0 +1,479 @@
+#!/usr/bin/env node
+
+// This code is used to connect a 4-axis CNC pendant with handwheel & emergency stop to a raspberry pi, and interfacing with CNCjs.
+// got mine here: https://www.banggood.com/Machifit-4-Axis-Pendant-CNC-Handwheel-with-Emergency-Stop-for-CNC-Machine-p-1219008.html
+
+var fs = require('fs');
+var path = require('path');
+var program = require('commander');
+var serialport = require('serialport');
+var inquirer = require('inquirer');
+var pkg = require('../package.json');
+var serverMain = require('../index');
+var sleep = require('sleep');
+var now = require("performance-now")
+
+// The electrical signals from the pendant are mapped to various GPIOs of the Raspberry pi
+
+var gpio = require('onoff').Gpio,
+// X/Y/Z/4 selector  
+  buttonX = new gpio(17, 'in', 'both', {debounceTimeout: 10});  
+  buttonY = new gpio(27, 'in', 'both', {debounceTimeout: 10});
+  buttonZ = new gpio(22, 'in', 'both', {debounceTimeout: 10});
+  button4 = new gpio(10, 'in', 'both', {debounceTimeout: 10});
+//X1/X10/X100 selector  
+  buttonX1 = new gpio(9, 'in', 'both', {debounceTimeout: 0});
+  buttonX10 = new gpio(11, 'in', 'both', {debounceTimeout: 0});
+  buttonX100 = new gpio(0, 'in', 'both', {debounceTimeout: 0});
+// Estop button  
+  buttonEStop = new gpio(5, 'in', 'both', {debounceTimeout: 10});
+// handwheel output signals  
+  buttonValA = new gpio(14, 'in', 'rising', {debounceTimeout: 10});
+  buttonValB = new gpio(15, 'in', 'both', {debounceTimeout: 10});
+// pendant LED control  
+  buttonLED = new gpio(18, 'out');
+
+const PULSES_THRESHOLD_FOR_SMOOTHJOG = 15 // number of consecutive dial ticks after which jogging is triggered
+const PULSES_THRESHOLD_FOR_SINGLESTEP = 2 // minimal number of consecutive dial ticks after which a single jog step is triggered
+const SINGLESTEP_X1_JOGDISTANCE = 0.1 // jog step in mm when X1 is selected
+const SINGLESTEP_X10_JOGDISTANCE = 1 // jog step in mm when X10 is selected
+const SINGLESTEP_X100_JOGDISTANCE = 10 // jog step in mm when X100 is selected
+const SMOOTHJOG_X1_JOGSPEED = 100 // continuous jog speed in mm/min when X1 is selected
+const SMOOTHJOG_X10_JOGSPEED = 1000 // continuous jog speed in mm/min when X10 is selected
+const SMOOTHJOG_X100_JOGSPEED = 5000 // continuous jog speed in mm/min when X100 is selected
+const SMOOTHJOG_BLANKING_PERIOD_ON_STOP = 100 // time in ms where we ignore dial events right after stopping a smooth jogging
+const SMOOTHJOG_COMMANDS_INTERVAL = 200 // period in ms at which the $J jogging commands are sent to the machine
+const SMOOTHJOG_JOGSTEP = 30 // unit step for continuous jog in mm. Needs to be long enough that at max jogspeed and considering the jog command interval, the movement is not completed before the next smooth jog command is sent.
+const HANDWHEEL_PULSE_TIMEOUT = 100 // max time in ms between two pulses of the A signal to consider that the pulses are part of a single user action.
+const FEEDHOLD_LEDBLINK_INTERVAL = 250 // blink period for LED during feed hold
+var options = {};
+
+program
+	.version(pkg.version)
+	.usage('-s <secret> -p <port> [options]')
+	.option('-l, --list', 'list available ports then exit')
+  .option('-s, --secret', 'the secret key stored in the ~/.cncrc file')
+	.option('-p, --port <port>', 'path or name of serial port')
+	.option('-b, --baudrate <baudrate>', 'baud rate (default: 115200)', 115200)
+	.option('--socket-address <address>', 'socket address or hostname (default: localhost)', 'localhost')
+	.option('--socket-port <port>', 'socket port (default: 8000)', 8000)
+	.option('--controller-type <type>', 'controller type: Grbl|Smoothie|TinyG (default: Grbl)', 'Grbl')
+  .option('--access-token-lifetime <lifetime>', 'access token lifetime in seconds or a time span string (default: 30d)', '30d')
+
+program.parse(process.argv);
+
+var options = {
+    secret: program.secret,
+    port: program.port,
+    baudrate: program.baudrate,
+    socketAddress: program.socketAddress,
+    socketPort: program.socketPort,
+    controllerType: program.controllerType,
+    accessTokenLifetime: program.accessTokenLifetime
+};
+
+if (options.list) {
+	serialport.list(function(err, ports) {
+		if (err) {
+			console.error(err);
+			process.exit(1);
+		}
+		ports.forEach(function(port) {
+			console.log(port.comName);
+		});
+	});
+	return;
+}
+
+var store = {
+    controller: {
+        state: {},
+        settings: {}
+    },
+    sender: {
+        status: {}
+    }
+};
+
+
+// Global Variables
+var enableSwitchPushed = false; //state of the enable pushbutton on the side of the jog dial
+
+var cooldown=false; // indicates whether we are currently waiting a bit after the end of a jogging action before taking new events into account
+var cooldownTimer= null; // timer to manage cooldown period
+
+var pulseTimer = null; // timer to detect whether handwheel pulses (on signal A) are consecutive or not.
+var pulseCounter = 0;  // counts pulses of signal A generated while handwheel is being turned
+
+var joggingTimer=null; // timer triggered regularly WHILE jogging, to support sending $J smooth jogging commands to GRBL
+var smoothJogging = false; // indicates whether we are currently in a jogging move
+
+var feedHoldTimer=null; // used to blink the LED while feedhold is active
+var feedholdActivated = false; // indicates whether we are currently in feedhold state or not
+
+const axes = {
+    X: 'X',
+    Y: 'Y',
+    Z: 'Z',
+    UNKNOWN: "unknown"
+}
+
+const XSelector = {
+	X1: "x1",
+	X10: "x10",
+	X100: "x100",
+	UNKNOWN : "unknown"
+}
+
+// callback for cooldown timer
+function cooldownFinished() {
+	// be ready to process events again
+	cooldown = false;
+	//console.log("STOP COOLDOWN")
+}
+
+// Determine position of the X1/X10/X100 selector
+function getXSelectorValue() {
+	var x1 = buttonX1.readSync()
+	var x10 = buttonX10.readSync()
+	var x100 = buttonX100.readSync()
+
+	// Normally, by design only one of the three positions should read as selected (grounded = read as 0), but let's be extra careful
+	// and also check that the other ones are inactive (open state = read as 1) to protect against electrical weirdness/glitches.
+	if (x1 == 0 && x10 == 1 && x100 == 1) {
+		return XSelector.X1;
+	} 
+	else if (x1 == 1 && x10 == 0 && x100 == 1) {
+		return XSelector.X10;
+	}
+	else if (x1 == 1 && x10 == 1 && x100 == 0) {
+		return XSelector.X100;
+	}
+	else
+		return XSelector.UNKNOWN
+}
+
+// Map X1/X10/X100 input to specific single jog distance
+function getJogDistance() {
+
+	var jogDistance = 0
+	switch(getXSelectorValue()) {
+		case XSelector.X1:
+			jogDistance = SINGLESTEP_X1_JOGDISTANCE;
+			break;
+		case XSelector.X10:
+			jogDistance = SINGLESTEP_X10_JOGDISTANCE;
+			break;
+		case XSelector.X100:
+			jogDistance = SINGLESTEP_X100_JOGDISTANCE;
+			break;
+	}
+	return jogDistance
+}
+
+// Map X1/X10/X100 input to specific smooth jogging speed
+function getJoggingSpeed() {
+	var jogSpeed = 0
+	switch(getXSelectorValue()) {
+		case XSelector.X1:
+			jogSpeed = SMOOTHJOG_X1_JOGSPEED;
+			break;
+		case XSelector.X10:
+			jogSpeed = SMOOTHJOG_X10_JOGSPEED;
+			break;
+		case XSelector.X100:
+			jogSpeed = SMOOTHJOG_X100_JOGSPEED;
+			break;
+	}
+	return jogSpeed
+}
+
+// Determine position of the OFF/X/Y/Z/4 selector
+function getSelectedAxis() {
+	var X = buttonX.readSync()
+	var Y = buttonY.readSync()
+	var Z = buttonZ.readSync()
+	var _4 = button4.readSync()
+
+	// Normally, by design only one of the five positions should read as selected (grounded = read as 0), but let's be extra careful
+	// and also check that the other ones are inactive (open state = read as 1) to protect against electrical weirdness/glitches.
+	if (X == 0 && Y == 1 && Z == 1 && _4 == 1) {
+		return axes.X
+	} 
+	else if (X ==1 && Y == 0 && Z == 1 && _4 == 1) {
+		return axes.Y
+	}
+	else if (X == 1 && Y == 1 && Z == 0 && _4 == 1) {
+		return axes.Z
+	}
+	else
+		return axes.UNKNOWN
+}
+
+// callback when timer expires after latest signal A pulse: this means 
+// that the user either finished a short turn, or stopped turninf the handwheel 
+function uponDialPulseTimeout() {
+	// If we were currently smooth jogging, we need to interrupt the latest and buffered jog commands, by sending 0x85 to GRBL
+	if (smoothJogging == true) {	
+		smoothJogging = false;
+		socket.emit('write', options.port, "\x85;\n")
+		clearInterval(joggingTimer);
+		console.log("SMOOTH JOGGING STOPPED")
+		
+		// Now start a blanking period where we will ignore (potential/spurious) discrete events.
+		// i.e. if the dial is turned by oneclick within that time after the end of a fast jog, it's most probably an involuntary move.
+		cooldown = true;
+		clearTimeout(cooldownTimer);
+		cooldownTimer = setTimeout(cooldownFinished, SMOOTHJOG_BLANKING_PERIOD_ON_STOP);
+	// else the wheel was turned by just a few clicks, we want to do a single jog step
+	} else {
+		// Single step jog:
+		// Go to relative distance mode (G91), use G0 (rapid move) to move by the predefined distance along the selected axis,then go back to absolute position mode (G90)
+
+		var selectedAxis = getSelectedAxis();
+		var jogDistance = getJogDistance();
+
+		if (selectedAxis != axes.UNKNOWN && jogDistance != 0) {
+			// positive number of ticks indicates the handwheel was turned clockwise
+			if (pulseCounter >= PULSES_THRESHOLD_FOR_SINGLESTEP) {
+				socket.emit('write', options.port, "G91;\n");
+				socket.emit('write', options.port, "G0 "+ selectedAxis + jogDistance +";\n");
+				socket.emit('write', options.port, "G90;\n");
+				console.log("STEP RIGHT " + selectedAxis + " by " + jogDistance)
+			}
+			// negative number of ticks indicates the handwheel was turned counterclockwise
+			else if (pulseCounter <= -PULSES_THRESHOLD_FOR_SINGLESTEP) {
+				socket.emit('write', options.port, "G91;\n");
+				socket.emit('write', options.port, "G0 "+ selectedAxis +"-"+ jogDistance +";\n");
+				socket.emit('write', options.port, "G90;\n");
+				console.log("STEP LEFT "+ selectedAxis + " by "+ jogDistance)		
+			}
+		}
+		else {
+			console.log("ERROR: uponDialPulseTimeout / unsupported signal")
+		}	
+	}
+	pulseCounter = 0;
+}
+
+// Callback for the interval timer triggered while jogging
+function uponJoggingTimer() {
+	if (smoothJogging == true) {
+
+		var selectedAxis = getSelectedAxis();
+		var jogSpeed = getJoggingSpeed();
+
+		if (selectedAxis != axes.UNKNOWN && jogSpeed != 0) {
+			// positive number of ticks indicates the handwheel turns clockwise, continue jogging in that direction
+			if (pulseCounter>=0) {
+				socket.emit('write', options.port, "$J=G91 G21 "+ selectedAxis + SMOOTHJOG_JOGSTEP + " F"+ jogSpeed + "\n")
+			}
+			// negative number of ticks indicates the handwheel turns counterclockwise, continue jogging in that direction
+			else {
+				socket.emit('write', options.port, "$J=G91 G21 "+ selectedAxis + "-" + SMOOTHJOG_JOGSTEP + " F"+ jogSpeed + "\n")
+			}
+		} else {
+			console.log("ERROR: uponJoggingTimer / unsupported signal")
+		}
+	}
+}
+
+// callback for enable button pushed
+function uponEnabled() {
+	enableSwitchPushed = true;
+	buttonLED.writeSync(1);
+	console.log("ENABLED")
+}
+
+// callback for enable button released
+function uponDisabled() {
+	enableSwitchPushed = false;
+	buttonLED.writeSync(0);
+	console.log("DISABLED")
+}
+// LED blink callback : toggle state
+function uponFeedHoldTimer() {
+	if (buttonLED.readSync() == 1)
+		buttonLED.writeSync(0);
+	else
+		buttonLED.writeSync(1);
+}
+
+// callback for enable button pushed
+function uponEStopEnabled() {
+	if (feedholdActivated == false) {
+		socket.emit('write', options.port, "!")
+		console.log("FEED HOLD!");
+		feedHoldTimer = setInterval(uponFeedHoldTimer, FEEDHOLD_LEDBLINK_INTERVAL);
+		feedholdActivated = true;
+	}
+}
+
+// callback for enable button released
+function uponEStopDisabled() {
+	if (feedholdActivated == true) {
+		socket.emit('write', options.port, "~")
+		clearInterval(feedHoldTimer);
+		buttonLED.writeSync(0);
+		console.log("RESUME");
+		feedholdActivated = false;
+	}
+}
+
+var createServer = function(options) {
+
+	// Hook up callback functions to each button/GPIO, the GPIO library will take care of calling those whenever their state changes.
+
+	// IMPORTANT: the enable pushbutton on the pendant I purchased, does NOT have a dedicated signal/wire available. What it does is close 
+	// the circuit on the other selectors/buttons. So an indirect way to figure out if the enable button is pushed, is by reading the X1/X10/X100
+	// selector: when the enable is not pushed, all three are open (and therefore read as "1"). When the enable button is pushed, one of the three
+	// signals will be read as active (grounded, so read as 0). As the selector can be on any of the three positions, need to re-evaluate the 
+	// situation each time either button changes state.
+
+	buttonX1.watch(function (err, state) {	
+		// if we were not already enabled, but now X1 just went from 1 (inactive) to 0 (active), it means the enable pushbutton was pressed
+		if (enableSwitchPushed==false && state == 0)
+			uponEnabled();
+		// if we were currently enabled, but now X1 just went from 0 (active) to 1 (inactive), AND the other two buttons also read as inactive, 
+		// this means the enable push button was released (opening the circuit)
+		else if ((enableSwitchPushed==true ) && (buttonX1.readSync() == 1) && (buttonX10.readSync() == 1) && (buttonX100.readSync() == 1) )
+			uponDisabled();
+	});			
+
+	buttonX10.watch(function (err, state) {
+		if (enableSwitchPushed==false && state == 0)
+			uponEnabled();	
+		else if ((enableSwitchPushed==true ) &&(buttonX1.readSync() == 1) && (buttonX10.readSync() == 1) && (buttonX100.readSync() == 1) )
+			uponDisabled();							
+	});	
+
+	buttonX100.watch(function (err, state) {
+		if (enableSwitchPushed==false && state == 0)
+			uponEnabled();	
+		else if ((enableSwitchPushed==true ) &&(buttonX1.readSync() == 1) && (buttonX10.readSync() == 1) && (buttonX100.readSync() == 1) )
+			uponDisabled();
+	});	
+
+	// In this version, we do nothing with the Estop.
+	buttonEStop.watch(function (err, state) {
+		if (state == 1) 
+			uponEStopEnabled();
+		else
+			uponEStopDisabled();
+	});	
+
+	// Monitor the pulses from the handwheel:
+	// while turning the handwheel, each click will generate one pulse of the A signal, and one pulse of the B pulse, slightly shifted in time.
+	// We only need to check rising edges of the A pulses (the GPIO is configured to do this, see top of the file), and then upon a rising edge 
+	// of A, we read the current state of the B signal, this will tell us if we are turning clockwise or counterclockwise.
+	buttonValA.watch(function (err, state) {
+
+		if (enableSwitchPushed && cooldown == false) { 
+			if (buttonValA.readSync() != buttonValB.readSync()) {
+				pulseCounter++; // the handwheel was just turned clockwise by one click
+			}
+			else {
+				pulseCounter--; // the handwheel was just turned counterclockwise by one click
+			}
+
+			// (re)arm pulse timer : if this pulse happens soon enough after the previous pulse, this will prevent the timer from expiring, 
+			// and we will continue counting pulses. If the user stops turning the wheel, the timer will eventually expire, and the callback
+			// will be called to decide what to do then.
+			clearTimeout(pulseTimer)
+			pulseTimer = setTimeout(uponDialPulseTimeout, HANDWHEEL_PULSE_TIMEOUT);
+
+			// If we reach the predefined min number of consecutive pulses, start smooth jogging mode
+			if ((smoothJogging == false) && (Math.abs(pulseCounter) > PULSES_THRESHOLD_FOR_SMOOTHJOG)) {
+				smoothJogging = true;
+				joggingTimer = setInterval(uponJoggingTimer, SMOOTHJOG_COMMANDS_INTERVAL);
+
+				var selectedAxis = getSelectedAxis();
+				var jogSpeed = getJoggingSpeed();
+
+				if (selectedAxis != axes.UNKNOWN && jogSpeed != 0) {
+					if (pulseCounter>=0) {
+						socket.emit('write', options.port, "$J=G91 G21 "+ selectedAxis + SMOOTHJOG_JOGSTEP + " F"+ jogSpeed + "\n")
+						console.log("START JOGGING "+ selectedAxis + " mm" + " in the positive direction at speed " + jogSpeed + " mm/min")				
+					}
+					else {
+						socket.emit('write', options.port, "$J=G91 G21 "+ selectedAxis + "-" + SMOOTHJOG_JOGSTEP + " F"+ jogSpeed + "\n")
+						console.log("START JOGGING "+ selectedAxis + " mm" + " in the negative direction at speed " + jogSpeed + " mm/min")			
+					}
+				} else {
+					console.log("ERROR: createServer smooth jogging / unsupported signal")
+				}
+			}
+		}
+	});	
+
+  // Server Connection, boilerplate code.
+  serverMain(options, function(err, socket) {
+      // Grbl
+      socket.on('Grbl:state', function(state) {
+          store.controller.state = state;
+      });
+      socket.on('Grbl:settings', function(settings) {
+          store.controller.settings = settings;
+      });
+
+      // Sender
+      socket.on('sender:status', function(data) {
+          store.sender.status = data;
+      });
+
+    });
+};
+
+if (options.port) {
+    createServer(options);
+    return;
+}
+
+serialport.list(function(err, ports) {
+    if (err) {
+        console.error(err);
+        process.exit(1);
+    }
+    const choices = ports.map(function(port) {
+        return port.comName;
+    });
+
+    inquirer.prompt([{
+        type: 'list',
+        name: 'port',
+        message: 'Specify which port you want to use?',
+        choices: choices
+    }]).then(function(answers) {
+        options.port = answers.port;
+
+        createServer(options);
+    });
+});
+
+// Clean Proccess Kill
+process.on('SIGINT', function () {
+	buttonX.unexport(); 
+	buttonY.unexport(); 
+	buttonZ.unexport();
+	button4.unexport();
+	buttonX1.unexport(); 
+	buttonX10.unexport();
+	buttonX100.unexport(); 
+	buttonEStop.unexport();
+	buttonValA.unexport(); 
+	buttonValB.unexport(); 
+	buttonLED.unexport();
+
+
+	clearTimeout(cooldownTimer);
+	cooldownTimer = null;
+
+	clearTimeout(pulseTimer);
+	pulseTimer = null;
+
+	clearInterval(joggingTimer);
+	joggingTimer = null;
+	
+	clearInterval(feedHoldTimer);
+	feedHoldTimer = null;	
+});
