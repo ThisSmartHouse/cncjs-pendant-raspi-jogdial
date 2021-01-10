@@ -1,6 +1,14 @@
 # cncjs-pendant-raspi-jogdial
 Pendant control for CNCjs interfacing a jogdial. Initially based on cncjs-pendant-raspi-gpio repo.
 
+## Installation
+
+In order for this to work properly as described below, you must set a number of Raspberry Pi pins to pullup-inputs by adding the following to `/boot/config.txt`:
+
+```
+gpio=17,27,22,10,9,11,0,5=pu
+```
+
 ## Usage
 Run `node bin/cncjs-pendant-raspi-jogdial` to start. Pass --help for more options.
 
